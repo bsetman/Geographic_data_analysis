@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8" />
+  <title>Leaflet + PostGIS GeoJSON API Demo</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <!-- Leaflet Draw -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css"/>
+  <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+
+  <style>
+    body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; }
+    #map { height: 100vh; width: 100vw; }
+    .panel {
+      position: absolute; top: 10px; left: 10px; z-index: 1000;
+      background: white; padding: 10px; border-radius: 6px; box-shadow: 0 2px 10px rgba(0,0,0,.15);
+      width: 320px;
+    }
+    .panel h3 { margin: 0 0 8px 0; font-size: 14px; }
+    .row { margin-bottom: 8px; }
+    .row label { display:block; font-size: 12px; color:#333; margin-bottom: 4px; }
+    .row input { width: 100%; padding: 6px; box-sizing: border-box; }
+    .btns { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+    button { padding: 8px; cursor: pointer; }
+    .hint { font-size: 12px; color:#555; margin-top: 8px; line-height: 1.35; }
+    .status { margin-top: 6px; font-size: 12px; color:#111; }
+  </style>
+</head>
+<body>
+<div id="map"></div>
+
+<div class="panel">
+  <h3>查询控制台（点选 + 画多边形）</h3>
+
+  <div class="row">
+    <label>API Base</label>
+    <input id="apiBase" value="http://127.0.0.1:8000" />
+  </div>
+
+  <div class="row">
+    <label>点（点击地图设置）</label>
+    <div id="ptInfo" style="font-size:12px;color:#333;">未设置</div>
+  </div>
+
+  <div class="row">
+    <label>半径/缓冲（米）</label>
+    <input id="meters" value="1000" />
+  </div>
+
+  <div class="row">
+    <label>K（最近邻数量）</label>
+    <input id="kval" value="10" />
+  </div>
+
+  <div class="btns">
+    <button onclick="runWithin()">距离范围</button>
+    <button onclick="runKNN()">最近邻KNN</button>
+    <button onclick="runBuffer()">缓冲区</button>
+    <button onclick="runPIP()">点在多边形</button>
+    <button onclick="runIntersects()">多边形相交</button>
+    <button onclick="runArea()">面积</button>
+    <button onclick="runPerimeter()">周长</button>
+    <button onclick="runUnion()">合并(Union)</button>
+    <button onclick="runIntersection()">交集(Intersection)</button>
+    <button onclick="runTransform()">坐标转换</button>
+  </div>
+
+  <button style="margin-top:8px;width:100%;" onclick="clearLayers()">清空结果图层</button>
+
+  <div class="hint">
+    使用方法：<br/>
+    1) 点击地图设置点；<br/>
+    2) 右上绘制工具画多边形；<br/>
+    3) 点击按钮查询，结果会叠加到地图上。<br/>
+    交集功能需要绘制两个多边形（先画两个）。<br/>
+  </div>
+
+  <div class="status" id="status"></div>
+</div>
+
+<script>
+  const map = L.map('map').setView([59.9391, 30.3158], 12);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19, attribution: '&copy; OpenStreetMap'
+  }).addTo(map);
+
+  let pointMarker = null;
+  let pointLL = null;
+
+  const drawnItems = new L.FeatureGroup();
+  map.addLayer(drawnItems);
+
+  // 绘制工具默认在左上角，容易被左上角面板遮挡；放到右上角更直观
+  const drawControl = new L.Control.Draw({
+    position: 'topright',
+    edit: { featureGroup: drawnItems },
+    draw: {
+      polygon: true,
+      polyline: false,
+      rectangle: true,
+      circle: false,
+      marker: false,
+      circlemarker: false
+    }
+  });
+  map.addControl(drawControl);
+
+  map.on(L.Draw.Event.CREATED, function (e) {
+    drawnItems.addLayer(e.layer);
+  });
+
+  map.on('click', function(e) {
+    pointLL = e.latlng;
+    if (pointMarker) map.removeLayer(pointMarker);
+    pointMarker = L.marker(pointLL).addTo(map);
+    document.getElementById("ptInfo").innerText = `lon=${pointLL.lng.toFixed(6)}, lat=${pointLL.lat.toFixed(6)}`;
+  });
+
+  const resultLayers = [];
+  function addGeoJsonLayer(geojson, name) {
+    if (!geojson) return;
+    // Leaflet 对 geometry=null 的 Feature 支持不稳定，直接忽略
+    if (geojson.type === 'Feature' && !geojson.geometry) {
+      return;
+    }
+    if (geojson.type === 'FeatureCollection' && (!geojson.features || geojson.features.length === 0)) {
+      return;
+    }
+    const layer = L.geoJSON(geojson, {
+      onEachFeature: (feature, lyr) => {
+        if (feature.properties) {
+          const props = JSON.stringify(feature.properties, null, 2);
+          lyr.bindPopup(`<pre style="white-space:pre-wrap;">${props}</pre>`);
+        }
+      }
+    }).addTo(map);
+    resultLayers.push(layer);
+  }
+
+  function setStatus(msg) {
+    document.getElementById("status").innerText = msg;
+  }
+
+  // 若 Leaflet.draw 未加载（CDN 被拦截/离线），给出明确提示
+  if (!L || !L.Control || !L.Control.Draw) {
+    setStatus("未加载绘制插件 Leaflet.draw：请检查网络/CDN，或改为本地引入 leaflet-draw 资源。");
+  }
+
+  function apiBase() {
+    return document.getElementById("apiBase").value.trim();
+  }
+
+  function meters() {
+    return parseFloat(document.getElementById("meters").value);
+  }
+
+  function kval() {
+    return parseInt(document.getElementById("kval").value, 10);
+  }
+
+  function getDrawnGeoms() {
+    const features = [];
+    drawnItems.eachLayer(l => {
+      features.push(l.toGeoJSON());
+    });
+    return features;
+  }
+
+  function getLastPolygonFeature() {
+    const feats = getDrawnGeoms().filter(f => f.geometry && (f.geometry.type.includes("Polygon")));
+    if (feats.length === 0) return null;
+    return feats[feats.length - 1];
+  }
+
+  async function postJson(path, payload) {
+    const res = await fetch(apiBase() + path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) {
+      const txt = await res.text();
+      throw new Error(txt || res.statusText);
+    }
+    return await res.json();
+  }
+
+  function clearLayers() {
+    resultLayers.forEach(l => map.removeLayer(l));
+    resultLayers.length = 0;
+    setStatus("已清空图层");
+  }
+
+  // --- Queries ---
+  async function runWithin() {
+    if (!pointLL) return setStatus("请先点击地图设置点");
+    setStatus("查询中...");
+    try {
+      const geojson = await postJson("/q/within-distance", {
+        lon: pointLL.lng, lat: pointLL.lat, radius_m: meters(), limit: 500
+      });
+      addGeoJsonLayer(geojson, "within");
+      setStatus("完成：距离范围结果已叠加");
+    } catch (e) { setStatus("错误: " + e.message); }
+  }
+
+  async function runKNN() {
+    if (!pointLL) return setStatus("请先点击地图设置点");
+    setStatus("查询中...");
+    try {
+      const geojson = await postJson("/q/knn", {
+        lon: pointLL.lng, lat: pointLL.lat, k: kval()
+      });
+      addGeoJsonLayer(geojson, "knn");
+      setStatus("完成：最近邻结果已叠加");
+    } catch (e) { setStatus("错误: " + e.message); }
+  }
+
+  async function runBuffer() {
+    if (!pointLL) return setStatus("请先点击地图设置点");
+    setStatus("查询中...");
+    try {
+      const out = await postJson("/q/buffer", {
+        lon: pointLL.lng, lat: pointLL.lat, buffer_m: meters(), limit: 1000
+      });
+      addGeoJsonLayer(out.buffer, "buffer");
+      addGeoJsonLayer(out.hits, "buffer_hits");
+      setStatus("完成：缓冲区与命中要素已叠加");
+    } catch (e) { setStatus("错误: " + e.message); }
+  }
+
+  async function runPIP() {
+    if (!pointLL) return setStatus("请先点击地图设置点");
+    setStatus("查询中...");
+    try {
+      const geojson = await postJson("/q/pip", { lon: pointLL.lng, lat: pointLL.lat });
+      addGeoJsonLayer(geojson, "pip");
+      setStatus("完成：点在多边形查询已叠加");
+    } catch (e) { setStatus("错误: " + e.message); }
+  }
+
+  async function runIntersects() {
+    const poly = getLastPolygonFeature();
+    if (!poly) return setStatus("请先绘制一个多边形/矩形");
+    setStatus("查询中...");
+    try {
+      const geojson = await postJson("/q/intersects", { geojson: poly });
+      addGeoJsonLayer(geojson, "intersects");
+      setStatus("完成：相交查询已叠加");
+    } catch (e) { setStatus("错误: " + e.message); }
+  }
+
+  async function runArea() {
+    const poly = getLastPolygonFeature();
+    if (!poly) return setStatus("请先绘制一个多边形/矩形");
+    setStatus("查询中...");
+    try {
+      const out = await postJson("/q/area", { geojson: poly });
+      setStatus(`面积：${out.area_m2.toFixed(2)} m² (${out.area_km2.toFixed(6)} km²)`);
+    } catch (e) { setStatus("错误: " + e.message); }
+  }
+
+  async function runPerimeter() {
+    const poly = getLastPolygonFeature();
+    if (!poly) return setStatus("请先绘制一个多边形/矩形");
+    setStatus("查询中...");
+    try {
+      const out = await postJson("/q/perimeter", { geojson: poly });
+      setStatus(`周长：${out.perimeter_m.toFixed(2)} m (${out.perimeter_km.toFixed(6)} km)`);
+    } catch (e) { setStatus("错误: " + e.message); }
+  }
+
+  async function runUnion() {
+    const polys = getDrawnGeoms().filter(f => f.geometry && f.geometry.type.includes("Polygon"));
+    if (polys.length < 1) return setStatus("请至少绘制一个多边形/矩形");
+    setStatus("查询中...");
+    try {
+      const out = await postJson("/q/union", { geoms: polys });
+      addGeoJsonLayer(out, "union");
+      setStatus(`完成：Union 已叠加（合并了 ${polys.length} 个面）`);
+    } catch (e) { setStatus("错误: " + e.message); }
+  }
+
+  async function runIntersection() {
+    const polys = getDrawnGeoms().filter(f => f.geometry && f.geometry.type.includes("Polygon"));
+    if (polys.length < 2) return setStatus("交集需要至少绘制两个多边形/矩形");
+    setStatus("查询中...");
+    try {
+      const a = polys[polys.length - 2];
+      const b = polys[polys.length - 1];
+      const out = await postJson("/q/intersection", { a, b });
+      addGeoJsonLayer(out, "intersection");
+      const area = out.properties && out.properties.area_m2 ? out.properties.area_m2 : 0;
+      setStatus(`完成：Intersection 已叠加，交集面积约 ${area.toFixed(2)} m²`);
+    } catch (e) { setStatus("错误: " + e.message); }
+  }
+
+  async function runTransform() {
+    const poly = getLastPolygonFeature();
+    if (!poly) return setStatus("请先绘制一个多边形/矩形");
+    setStatus("查询中...");
+    try {
+      const out = await postJson("/q/transform", { geojson: poly, to_epsg: 3857 });
+      // 后端返回：geometry=4326（可直接显示）；properties.geom_transformed=目标EPSG坐标
+      addGeoJsonLayer(out, "transform");
+      setStatus("坐标转换完成：已叠加原始几何；目标 EPSG 坐标在弹窗 properties.geom_transformed 中。");
+    } catch (e) { setStatus("错误: " + e.message); }
+  }
+</script>
+</body>
+</html>
