@@ -1,0 +1,378 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <title>Демо: Leaflet + PostGIS GeoJSON API</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <!-- Leaflet Draw -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css"/>
+  <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+
+  <style>
+    body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; }
+    #map { height: 100vh; width: 100vw; }
+    .panel {
+      position: absolute; top: 10px; left: 10px; z-index: 1000;
+      background: white; padding: 10px; border-radius: 6px; box-shadow: 0 2px 10px rgba(0,0,0,.15);
+      width: 320px;
+    }
+    .panel h3 { margin: 0 0 8px 0; font-size: 14px; }
+    .row { margin-bottom: 8px; }
+    .row label { display:block; font-size: 12px; color:#333; margin-bottom: 4px; }
+    .row input { width: 100%; padding: 6px; box-sizing: border-box; }
+    .btns { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+    button { padding: 8px; cursor: pointer; }
+    .hint { font-size: 12px; color:#555; margin-top: 8px; line-height: 1.35; }
+    .status { margin-top: 6px; font-size: 12px; color:#111; }
+  </style>
+</head>
+<body>
+<div id="map"></div>
+
+<div class="panel">
+  <h3>Панель запросов (точка + полигон)</h3>
+
+  <div class="row">
+    <label>База API</label>
+    <input id="apiBase" value="http://127.0.0.1:8000" />
+  </div>
+
+  <div class="row">
+    <label>Точка (кликните по карте)</label>
+    <div id="ptInfo" style="font-size:12px;color:#333;">Не задано</div>
+  </div>
+
+  <div class="row">
+    <label>Радиус/буфер (м)</label>
+    <input id="meters" value="1000" />
+  </div>
+
+  <div class="row">
+    <label>K (кол-во ближайших)</label>
+    <input id="kval" value="10" />
+  </div>
+
+  <div class="btns">
+    <button onclick="runWithin()">Поиск в радиусе</button>
+    <button onclick="runKNN()">Ближайшие K (KNN)</button>
+    <button onclick="runBuffer()">Буфер</button>
+    <button onclick="runPIP()">Точка в полигоне</button>
+    <button onclick="runIntersects()">Пересечение полигонов</button>
+    <button onclick="runArea()">Площадь</button>
+    <button onclick="runPerimeter()">Периметр</button>
+    <button onclick="runUnion()">Объединить (Union)</button>
+    <button onclick="runIntersection()">Пересечение (Intersection)</button>
+    <button onclick="runTransform()">Преобразование координат</button>
+  </div>
+
+  <button style="margin-top:8px;width:100%;" onclick="clearLayers()">Очистить слои результатов</button>
+
+  <div class="hint">
+    Как пользоваться:<br/>
+    1) Кликните по карте, чтобы задать точку;<br/>
+    2) Нарисуйте полигон/прямоугольник инструментом справа сверху;<br/>
+    3) Нажмите кнопку запроса — результат появится на карте.<br/>
+    Для Intersection нарисуйте два полигона (сначала два).<br/>
+  </div>
+
+  <div class="status" id="status"></div>
+</div>
+
+<script>
+  const map = L.map('map').setView([59.9391, 30.3158], 12);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19, attribution: '&copy; OpenStreetMap'
+  }).addTo(map);
+
+  let pointMarker = null;
+  let pointLL = null;
+
+  map.on('click', function(e) {
+    pointLL = e.latlng;
+    if (pointMarker) map.removeLayer(pointMarker);
+    pointMarker = L.marker(pointLL).addTo(map);
+    document.getElementById("ptInfo").innerText = `lon=${pointLL.lng.toFixed(6)}, lat=${pointLL.lat.toFixed(6)}`;
+  });
+
+
+  const drawnItems = new L.FeatureGroup();
+  map.addLayer(drawnItems);
+// 绘制工具默认在左上角，容易被左上角面板遮挡；放到右上角更直观
+  
+  // --- Leaflet.draw: Russian localization patch (safe) ---
+  function patchDrawLocalRu() {
+    if (!window.L || !L.drawLocal) return;
+    // Toolbar actions
+    L.drawLocal.draw.toolbar.actions = L.drawLocal.draw.toolbar.actions || {};
+    L.drawLocal.draw.toolbar.actions.title = 'Отменить рисование';
+    L.drawLocal.draw.toolbar.actions.text = 'Отмена';
+
+    L.drawLocal.draw.toolbar.finish = L.drawLocal.draw.toolbar.finish || {};
+    L.drawLocal.draw.toolbar.finish.title = 'Завершить';
+    L.drawLocal.draw.toolbar.finish.text = 'Готово';
+
+    L.drawLocal.draw.toolbar.undo = L.drawLocal.draw.toolbar.undo || {};
+    L.drawLocal.draw.toolbar.undo.title = 'Удалить последнюю точку';
+    L.drawLocal.draw.toolbar.undo.text = 'Назад';
+
+    // Buttons
+    L.drawLocal.draw.toolbar.buttons = L.drawLocal.draw.toolbar.buttons || {};
+    if (L.drawLocal.draw.toolbar.buttons.polygon !== undefined) {
+      L.drawLocal.draw.toolbar.buttons.polygon = 'Нарисовать полигон';
+    }
+    if (L.drawLocal.draw.toolbar.buttons.rectangle !== undefined) {
+      L.drawLocal.draw.toolbar.buttons.rectangle = 'Нарисовать прямоугольник';
+    }
+
+    // Tooltips (only if present)
+    if (L.drawLocal.draw.handlers && L.drawLocal.draw.handlers.polygon && L.drawLocal.draw.handlers.polygon.tooltip) {
+      L.drawLocal.draw.handlers.polygon.tooltip.start = 'Кликните, чтобы начать полигон.';
+      L.drawLocal.draw.handlers.polygon.tooltip.cont = 'Кликните, чтобы продолжить.';
+      L.drawLocal.draw.handlers.polygon.tooltip.end = 'Кликните на первую точку, чтобы завершить.';
+    }
+    if (L.drawLocal.draw.handlers && L.drawLocal.draw.handlers.rectangle && L.drawLocal.draw.handlers.rectangle.tooltip) {
+      L.drawLocal.draw.handlers.rectangle.tooltip.start = 'Нажмите и тяните, чтобы нарисовать прямоугольник.';
+    }
+    if (L.drawLocal.edit && L.drawLocal.edit.toolbar) {
+      L.drawLocal.edit.toolbar.buttons = L.drawLocal.edit.toolbar.buttons || {};
+      if (L.drawLocal.edit.toolbar.buttons.edit !== undefined) L.drawLocal.edit.toolbar.buttons.edit = 'Редактировать объекты';
+      if (L.drawLocal.edit.toolbar.buttons.remove !== undefined) L.drawLocal.edit.toolbar.buttons.remove = 'Удалить объекты';
+      if (L.drawLocal.edit.toolbar.buttons.editDisabled !== undefined) L.drawLocal.edit.toolbar.buttons.editDisabled = 'Нет объектов для редактирования';
+      if (L.drawLocal.edit.toolbar.buttons.removeDisabled !== undefined) L.drawLocal.edit.toolbar.buttons.removeDisabled = 'Нет объектов для удаления';
+    }
+    if (L.drawLocal.edit && L.drawLocal.edit.toolbar && L.drawLocal.edit.toolbar.actions) {
+      if (L.drawLocal.edit.toolbar.actions.save) {
+        L.drawLocal.edit.toolbar.actions.save.title = 'Сохранить изменения';
+        L.drawLocal.edit.toolbar.actions.save.text = 'Сохранить';
+      }
+      if (L.drawLocal.edit.toolbar.actions.cancel) {
+        L.drawLocal.edit.toolbar.actions.cancel.title = 'Отменить изменения';
+        L.drawLocal.edit.toolbar.actions.cancel.text = 'Отмена';
+      }
+    }
+  }
+
+if (typeof L.Control !== 'undefined' && typeof L.Control.Draw === 'function') {
+    patchDrawLocalRu();
+    const drawControl = new L.Control.Draw({
+    position: 'topright',
+    edit: { featureGroup: drawnItems },
+    draw: {
+    polygon: true,
+    polyline: false,
+    rectangle: true,
+    circle: false,
+    marker: false,
+    circlemarker: false
+    }
+    });
+    map.addControl(drawControl);
+    
+    map.on(L.Draw.Event.CREATED, function (e) {
+    drawnItems.addLayer(e.layer);
+    });
+  } else {
+    console.warn('Leaflet.draw is not loaded.');
+    const el = document.getElementById('status');
+    if (el) el.innerText = 'Плагин Leaflet.draw не загружен: проверьте сеть/CDN или подключите leaflet-draw локально.';
+  }
+
+
+  const resultLayers = [];
+  function addGeoJsonLayer(geojson, name) {
+    if (!geojson) return;
+    // Leaflet 对 geometry=null 的 Feature 支持不稳定，直接忽略
+    if (geojson.type === 'Feature' && !geojson.geometry) {
+      return;
+    }
+    if (geojson.type === 'FeatureCollection' && (!geojson.features || geojson.features.length === 0)) {
+      return;
+    }
+    const layer = L.geoJSON(geojson, {
+      onEachFeature: (feature, lyr) => {
+        if (feature.properties) {
+          const props = JSON.stringify(feature.properties, null, 2);
+          lyr.bindPopup(`<pre style="white-space:pre-wrap;">${props}</pre>`);
+        }
+      }
+    }).addTo(map);
+    resultLayers.push(layer);
+  }
+
+  function setStatus(msg) {
+    document.getElementById("status").innerText = msg;
+  }
+
+  // 若 Leaflet.draw 未加载（CDN 被拦截/离线），给出明确提示
+  if (!L || !L.Control || !L.Control.Draw) {
+    setStatus("Плагин Leaflet.draw не загружен: проверьте сеть/CDN или подключите leaflet-draw локально.");
+  }
+
+  function apiBase() {
+    return document.getElementById("apiBase").value.trim();
+  }
+
+  function meters() {
+    return parseFloat(document.getElementById("meters").value);
+  }
+
+  function kval() {
+    return parseInt(document.getElementById("kval").value, 10);
+  }
+
+  function getDrawnGeoms() {
+    const features = [];
+    drawnItems.eachLayer(l => {
+      features.push(l.toGeoJSON());
+    });
+    return features;
+  }
+
+  function getLastPolygonFeature() {
+    const feats = getDrawnGeoms().filter(f => f.geometry && (f.geometry.type.includes("Polygon")));
+    if (feats.length === 0) return null;
+    return feats[feats.length - 1];
+  }
+
+  async function postJson(path, payload) {
+    const res = await fetch(apiBase() + path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) {
+      const txt = await res.text();
+      throw new Error(txt || res.statusText);
+    }
+    return await res.json();
+  }
+
+  function clearLayers() {
+    resultLayers.forEach(l => map.removeLayer(l));
+    resultLayers.length = 0;
+    setStatus("Слои очищены");
+  }
+
+  // --- Queries ---
+  async function runWithin() {
+    if (!pointLL) return setStatus("Сначала выберите точку на карте");
+    setStatus("Выполняется запрос…");
+    try {
+      const geojson = await postJson("/q/within-distance", {
+        lon: pointLL.lng, lat: pointLL.lat, radius_m: meters(), limit: 500
+      });
+      addGeoJsonLayer(geojson, "within");
+      setStatus("Готово: результаты поиска в радиусе добавлены");
+    } catch (e) { setStatus("Ошибка: " + e.message); }
+  }
+
+  async function runKNN() {
+    if (!pointLL) return setStatus("Сначала выберите точку на карте");
+    setStatus("Выполняется запрос…");
+    try {
+      const geojson = await postJson("/q/knn", {
+        lon: pointLL.lng, lat: pointLL.lat, k: kval()
+      });
+      addGeoJsonLayer(geojson, "knn");
+      setStatus("Готово: ближайшие объекты добавлены");
+    } catch (e) { setStatus("Ошибка: " + e.message); }
+  }
+
+  async function runBuffer() {
+    if (!pointLL) return setStatus("Сначала выберите точку на карте");
+    setStatus("Выполняется запрос…");
+    try {
+      const out = await postJson("/q/buffer", {
+        lon: pointLL.lng, lat: pointLL.lat, buffer_m: meters(), limit: 1000
+      });
+      addGeoJsonLayer(out.buffer, "buffer");
+      addGeoJsonLayer(out.hits, "buffer_hits");
+      setStatus("Готово: буфер и найденные объекты добавлены");
+    } catch (e) { setStatus("Ошибка: " + e.message); }
+  }
+
+  async function runPIP() {
+    if (!pointLL) return setStatus("Сначала выберите точку на карте");
+    setStatus("Выполняется запрос…");
+    try {
+      const geojson = await postJson("/q/pip", { lon: pointLL.lng, lat: pointLL.lat });
+      addGeoJsonLayer(geojson, "pip");
+      setStatus("Готово: результат «точка в полигоне» добавлен");
+    } catch (e) { setStatus("Ошибка: " + e.message); }
+  }
+
+  async function runIntersects() {
+    const poly = getLastPolygonFeature();
+    if (!poly) return setStatus("Сначала нарисуйте полигон/прямоугольник");
+    setStatus("Выполняется запрос…");
+    try {
+      const geojson = await postJson("/q/intersects", { geojson: poly });
+      addGeoJsonLayer(geojson, "intersects");
+      setStatus("Готово: пересечения добавлены");
+    } catch (e) { setStatus("Ошибка: " + e.message); }
+  }
+
+  async function runArea() {
+    const poly = getLastPolygonFeature();
+    if (!poly) return setStatus("Сначала нарисуйте полигон/прямоугольник");
+    setStatus("Выполняется запрос…");
+    try {
+      const out = await postJson("/q/area", { geojson: poly });
+      setStatus(`Площадь: ${out.area_m2.toFixed(2)} m² (${out.area_km2.toFixed(6)} km²)`);
+    } catch (e) { setStatus("Ошибка: " + e.message); }
+  }
+
+  async function runPerimeter() {
+    const poly = getLastPolygonFeature();
+    if (!poly) return setStatus("Сначала нарисуйте полигон/прямоугольник");
+    setStatus("Выполняется запрос…");
+    try {
+      const out = await postJson("/q/perimeter", { geojson: poly });
+      setStatus(`Периметр: ${out.perimeter_m.toFixed(2)} m (${out.perimeter_km.toFixed(6)} km)`);
+    } catch (e) { setStatus("Ошибка: " + e.message); }
+  }
+
+  async function runUnion() {
+    const polys = getDrawnGeoms().filter(f => f.geometry && f.geometry.type.includes("Polygon"));
+    if (polys.length < 1) return setStatus("Нарисуйте хотя бы один полигон/прямоугольник");
+    setStatus("Выполняется запрос…");
+    try {
+      const out = await postJson("/q/union", { geoms: polys });
+      addGeoJsonLayer(out, "union");
+      setStatus(`Готово: Union добавлен (объединено ${polys.length}  полигонов)`);
+    } catch (e) { setStatus("Ошибка: " + e.message); }
+  }
+
+  async function runIntersection() {
+    const polys = getDrawnGeoms().filter(f => f.geometry && f.geometry.type.includes("Polygon"));
+    if (polys.length < 2) return setStatus("Для Intersection нужно минимум два полигона/прямоугольника");
+    setStatus("Выполняется запрос…");
+    try {
+      const a = polys[polys.length - 2];
+      const b = polys[polys.length - 1];
+      const out = await postJson("/q/intersection", { a, b });
+      addGeoJsonLayer(out, "intersection");
+      const area = out.properties && out.properties.area_m2 ? out.properties.area_m2 : 0;
+      setStatus(`Готово: Intersection добавлен, площадь ≈ ${area.toFixed(2)} m²`);
+    } catch (e) { setStatus("Ошибка: " + e.message); }
+  }
+
+  async function runTransform() {
+    const poly = getLastPolygonFeature();
+    if (!poly) return setStatus("Сначала нарисуйте полигон/прямоугольник");
+    setStatus("Выполняется запрос…");
+    try {
+      const out = await postJson("/q/transform", { geojson: poly, to_epsg: 3857 });
+      // 后端返回：geometry=4326（可直接显示）；properties.geom_transformed=目标EPSG坐标
+      addGeoJsonLayer(out, "transform");
+      setStatus("Преобразование завершено: исходная геометрия добавлена; геометрия в целевой EPSG доступна в properties.geom_transformed.");
+    } catch (e) { setStatus("Ошибка: " + e.message); }
+  }
+</script>
+</body>
+</html>
